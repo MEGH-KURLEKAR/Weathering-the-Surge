@@ -1,0 +1,490 @@
+---
+title: "Group_4_IDS_Project"
+Group: "Abhinav Bhandari, Megh Kurlekar, Sumit Kharche, Yash Singh"
+output: html_document
+date: "2025-04-24"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+#install.packages("arrow")
+#install.packages("tidyverse")
+#install.packages("lubridate")
+#install.packages("data.table")
+#install.packages("randomForest")
+#install.packages("caret")
+#install.packages("openxlsx")
+#install.packages("corrplot")
+#install.packages("ggcorrplot")
+#install.packages("ggplot2")
+#install.packages("tigris")
+#install.packages("sf")
+library(tidyverse)
+library(arrow)
+library(lubridate)
+library(data.table)
+#install.packages("randomForest")
+library(randomForest)
+library(caret)
+library(openxlsx)
+#install.packages("corrplot")
+library(corrplot)
+#install.packages("ggcorrplot")
+library(ggcorrplot)
+library(ggplot2)
+install.packages("tigris")
+library(tigris)
+library(sf)
+```
+
+
+# 1. Data Reading & Initial Preparation
+
+```{r}
+# Load Static House Data
+static_house_df = read_parquet("https://intro-datascience.s3.us-east-2.amazonaws.com/SC-data/static_house_info.parquet")
+```
+```{r}
+# Load July Weather Data for Each County
+counties = unique(static_house_df$in.county)
+weather_list = lapply(counties, function(cnty) {
+  df = read_csv(paste0("https://intro-datascience.s3.us-east-2.amazonaws.com/SC-data/weather/2023-weather-data/", cnty, ".csv"))
+  df = df %>% 
+    mutate(datetime = as.POSIXct(date_time)) %>% 
+    filter(month(datetime) == 7) %>% 
+    mutate(county = cnty)
+})
+weather_all = bind_rows(weather_list)
+```
+
+```{r}
+# Load Energy Data for 10 Sample Houses for July
+sample_housing = static_house_df$bldg_id[1:10]
+energy_list = list()
+for (id in sample_housing) {
+  url = paste0("https://intro-datascience.s3.us-east-2.amazonaws.com/SC-data/2023-houseData/", id, ".parquet")
+  df = read_parquet(url)
+  df = df %>% mutate(datetime = as.POSIXct(time), bldg_id = id) %>%
+    filter(month(datetime) == 7)
+  energy_list[[as.character(id)]] = df
+}
+energy_usage_df = bind_rows(energy_list)
+```
+```{r}
+# Merge Static, Energy, and Weather
+static_house_df = static_house_df %>% rename(county = in.county)
+combined_df = energy_usage_df %>%
+  left_join(static_house_df, by = "bldg_id") %>%
+  left_join(weather_all, by = c("datetime", "county")) %>%
+  drop_na()
+```
+
+
+# 2. Data Cleaning
+```{r}
+all_zero_or_na = function(x) all(is.na(x) | x == 0)
+cleaned_df = combined_df[, !sapply(combined_df, all_zero_or_na)]
+
+if ("out.electricity.pv.energy_consumption" %in% names(cleaned_df)) {
+  cleaned_df$out.electricity.pv.energy_consumption[cleaned_df$out.electricity.pv.energy_consumption < 0] = 0
+}
+
+cleaned_df = cleaned_df %>%
+  mutate(out.total.energy = rowSums(across(contains(".energy_consumption")), na.rm = TRUE),
+         in.cooling_setpoint = as.numeric(gsub("F", "", in.cooling_setpoint)),
+         Day = day(datetime),
+         Hour = hour(datetime))
+
+```
+
+
+# 4. Build Random Forest Model
+```{r}
+model_data = cleaned_df %>%
+  select(
+    energy = out.total.energy,
+    temp = `Dry Bulb Temperature [°C]`,
+    sqft = in.sqft,
+    occupants = in.occupants,
+    stories = in.geometry_stories,
+    hour = Hour,
+    county = county
+  ) %>%
+  mutate(county = as.factor(county)) %>%
+  drop_na()
+
+```
+
+```{r}
+set.seed(100)
+split = createDataPartition(model_data$energy, p = 0.7, list = FALSE)
+train = model_data[split, ]
+test = model_data[-split, ]
+```
+
+```{r}
+rf_model = randomForest(energy ~ ., data = train, ntree = 100)
+# Save model to use in Shiny app
+saveRDS(rf_model, file = "model.rds")
+test$predicted = predict(rf_model, newdata = test)
+```
+
+
+# 5. Evaluate Model Accuracy
+```{r}
+rmse_value = RMSE(test$predicted, test$energy)
+r2_value = cor(test$predicted, test$energy)^2
+cat("Model RMSE:", round(rmse_value, 2), "\n")
+cat("Model R²:", round(r2_value, 3), "\n")
+```
+
+
+# 6. Simulate +5°F Scenario
+```{r}
+temp_plus5 = test
+temp_plus5$temp = temp_plus5$temp + 5
+temp_plus5$predicted_plus5 = predict(rf_model, newdata = temp_plus5)
+```
+
+
+# 7. Peak Demand Visualizations
+```{r}
+# County-level Peak
+county_peak_energy = temp_plus5 %>% group_by(county) %>% summarise(peak_kWh = max(predicted_plus5))
+
+ggplot(county_peak_energy, aes(x = reorder(county, -peak_kWh), y = peak_kWh)) +
+  geom_col(fill = "turquoise") +
+  labs(title = "Peak Usage by County (+5°F)", y = "Peak Energy (kWh)") +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 65, hjust = 1))
+```
+
+
+# Stories-level Peak
+```{r}
+story_peak_energy = temp_plus5 %>% group_by(stories) %>% summarise(peak_kWh = max(predicted_plus5))
+```
+
+```{r}
+ggplot(story_peak_energy, aes(x = as.numeric(stories), y = peak_kWh)) +
+  geom_line(color = "cyan", size = 1.2) +
+  geom_point(size = 3, color = "red") +
+  labs(title = "Trend for Peak Usage basaed on Number of Stories", x = "Stories", y = "Peak Energy (kWh)") +
+  theme_minimal(base_size = 13)
+```
+
+# 8. Strategy to Reduce Peak
+```{r}
+temp_plus5$adjusted_usage = ifelse(temp_plus5$predicted_plus5 > quantile(temp_plus5$predicted_plus5, 0.9),
+                                    temp_plus5$predicted_plus5 * 0.90, temp_plus5$predicted_plus5)
+```
+
+```{r}
+adj_peak = max(temp_plus5$adjusted_usage)
+peak_plus5 = max(temp_plus5$predicted_plus5)
+reduction = peak_plus5 - adj_peak
+```
+
+```{r}
+cat("Adjusted Peak After Strategy:", round(adj_peak, 2), "kWh\n")
+cat("Peak Reduction:", round(reduction, 2), "kWh\n")
+```
+
+## Appliance Usage and Cooling System Plots
+
+# 1. Energy Consumption by Appliance
+```{r}
+july_data = energy_usage_df %>% filter(month(datetime) == 7)
+july_data_pivoted = july_data %>%
+  select(datetime, contains(".energy_consumption")) %>%
+  pivot_longer(cols = -datetime, names_to = "appliance", values_to = "consumption") %>%
+  mutate(appliance = gsub("out\\.electricity\\.|\\.energy_consumption", "", appliance))
+```
+
+```{r}
+# 1) Sum up consumption by appliance
+july_summary = july_data_pivoted %>%
+  group_by(appliance) %>%
+  summarise(consumption = sum(consumption, na.rm = TRUE)) %>%
+  ungroup()
+
+# 2) Plot – modified from your screenshot
+ggplot(july_summary, aes(x = fct_reorder(appliance, consumption), y = consumption, fill = consumption)) + geom_col(show.legend = FALSE) + coord_flip() + scale_fill_viridis_c(option = "C") + labs(title = "Energy Consumption by Appliance (July)", x = NULL, y = "Total Energy Consumption") + theme_minimal(base_size = 14) + theme(panel.grid.major.y = element_blank(), axis.text.y = element_text(size = 7)) + scale_fill_gradient(low = "cyan", high = "darkblue")
+
+```
+# 2. Total Electricity Usage by Cooling System
+```{r}
+df2 = cleaned_df %>% mutate(in.hvac_cooling_type = ifelse(in.hvac_cooling_type == 'None', 'No Cooling System', in.hvac_cooling_type))
+```
+
+```{r}
+ggplot(df2, aes(x = in.hvac_cooling_type, y = out.total.energy, fill = in.hvac_cooling_type)) +
+  geom_col() +
+  labs(x = "Cooling System", y = "Total Energy (kWh)", title = "Total Energy Consumed Cooling System") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 0, hjust = 1)) +   scale_fill_manual(values = c(
+    "Central AC" = "navy",
+    "No Cooling System" = "green"
+  ))
+  
+```
+# 3. Average Electricity Consumption per Cooling Setpoint
+```{r}
+average_setpoint = cleaned_df %>%
+  group_by(in.cooling_setpoint) %>%
+  summarise(avg_total_energy = mean(out.total.energy, na.rm = TRUE))
+```
+
+```{r}
+ggplot(average_setpoint, aes(x = as.factor(in.cooling_setpoint), y = avg_total_energy)) +
+  geom_bar(stat = "identity", fill = "orange") +
+  labs(title = "Avg Electricity Consumption per Cooling Setpoint", x = "Cooling Setpoint", y = "Avg Energy (kWh)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 0, hjust = 1))
+```
+
+```{r load_libraries, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+```
+
+```{r}
+# Energy Usage Peaks: hourly line chart
+hourly_usage = cleaned_df %>%
+  mutate(Hour = hour(datetime)) %>%
+  group_by(Hour) %>%
+  summarise(total_energy = sum(out.total.energy, na.rm = TRUE)) %>%
+  ungroup()
+
+ggplot(hourly_usage, aes(x = Hour, y = total_energy)) +
+  geom_line(size = 1, color = "steelblue") +
+  geom_point(size = 2, color = "steelblue") +
+  scale_x_continuous(breaks = 0:23) +
+  labs(
+    title = "Hourly Energy Usage Peaks",
+    x     = "Hour of Day",
+    y     = "Total Energy (kWh)"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+```{r}
+#Key Contributors: pie chart of appliance energy consumption
+appliance_contrib = cleaned_df %>%
+  select(contains(".energy_consumption")) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to  = "component",
+    values_to = "consumption"
+  ) %>%
+  group_by(component) %>%
+  summarise(total = sum(consumption, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(
+    component = gsub("out\\.electricity\\.|\\.energy_consumption", "", component),
+    pct       = total / sum(total) * 100,
+    label     = paste0(component, " (", round(pct, 1), "%)")
+  )
+
+ggplot(appliance_contrib, aes(x = "", y = total, fill = component)) +
+  geom_col(width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  labs(
+    title = "Energy Consumption by Component"
+  ) +
+  theme_void() +
+  theme(
+    plot.title   = element_text(hjust = 0.5),
+    legend.title = element_blank()
+  )
+```
+
+```{r}
+#Regional Variations: bar chart by county
+regional_usage = cleaned_df %>%
+  group_by(county) %>%
+  summarise(total_energy = sum(out.total.energy, na.rm = TRUE)) %>%
+  ungroup()
+
+ggplot(regional_usage, aes(x = reorder(county, -total_energy), y = total_energy, fill = county)) +
+  geom_col(show.legend = FALSE) +
+  labs(
+    title = "Total Energy Usage by County",
+    x     = "County",
+    y     = "Total Energy (kWh)"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title  = element_text(hjust = 0.5)
+  )
+```
+
+## c) Modeling energy usage for July
+
+```{r load-model-libs, message=FALSE, warning=FALSE}
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(caret)
+#install.packages("gbm")
+library(gbm)
+```
+
+```{r}
+# Filter to July and pick your predictors
+july_df = cleaned_df %>% 
+  filter(month(datetime) == 7) %>% 
+  mutate(
+    Hour     = hour(datetime),
+    Temp     = `Dry Bulb Temperature [°C]`,
+    Setpoint = in.cooling_setpoint
+  ) %>% 
+  select(out.total.energy, Hour, Temp, Setpoint) %>% 
+  drop_na()
+
+# Split the dataset into 70% and 30% for training and testing respectively.
+set.seed(42)
+idx   = createDataPartition(july_df$out.total.energy, p = .7, list = FALSE)
+train = july_df[idx, ]
+test  = july_df[-idx, ]
+```
+
+
+```{r}
+# Exploring various models
+lm_mod    = lm(out.total.energy ~ Hour + Temp + Setpoint, data = train)
+test$lm   = predict(lm_mod, test)
+
+# Metrics
+lm_rmse   = RMSE(test$lm, test$out.total.energy)
+lm_r2     = R2(test$lm,  test$out.total.energy)
+```
+
+```{r}
+gbm_mod   = gbm(
+  formula      = out.total.energy ~ Hour + Temp + Setpoint,
+  data         = train,
+  distribution = "gaussian",
+  n.trees      = 1000,
+  interaction.depth = 3,
+  shrinkage    = 0.01,
+  cv.folds     = 5,
+  verbose      = FALSE
+)
+best_iter = gbm.perf(gbm_mod, method = "cv")
+test$gbm  = predict(gbm_mod, test, n.trees = best_iter)
+
+gbm_rmse  = RMSE(test$gbm, test$out.total.energy)
+gbm_r2    = R2(test$gbm, test$out.total.energy)
+```
+
+
+```{r}
+poly_mod  = lm(out.total.energy ~ poly(Hour, 3) + Temp + Setpoint, data = train)
+test$poly = predict(poly_mod, test)
+
+poly_rmse = RMSE(test$poly, test$out.total.energy)
+poly_r2   = R2(test$poly, test$out.total.energy)
+```
+
+```{r}
+results = tibble(
+  Model = c("Linear Reg.", "GBM", "Poly Reg."),
+  RMSE  = c(lm_rmse, gbm_rmse, poly_rmse),
+  R2    = c(lm_r2,   gbm_r2,   poly_r2)
+)
+
+knitr::kable(results, digits = 3, 
+             caption = "July Energy Usage Models: RMSE & R²")
+```
+
+
+
+```{r future_scenarios_full, message=FALSE, warning=FALSE}
+# 0. load libraries
+library(dplyr)
+library(lubridate)
+library(caret)
+install.packages("xgboost")
+library(xgboost)
+library(ggplot2)
+library(tidyr)
+
+# 1. Prepare July training data
+july_df = cleaned_df %>%
+  filter(month(datetime)==7) %>%
+  mutate(
+    Hour     = hour(datetime),
+    Temp     = `Dry Bulb Temperature [°C]`,
+    Setpoint = in.cooling_setpoint
+  ) %>%
+  select(out.total.energy, Hour, Temp, Setpoint) %>%
+  drop_na()
+
+set.seed(42)
+split_idx = createDataPartition(july_df$out.total.energy, p=0.7, list=FALSE)
+train_df   = july_df[ split_idx, ]
+test_df    = july_df[-split_idx, ]
+
+# 2. Train XGBoost (caret wrapper)
+xgb_ctrl = trainControl(method="cv", number=5)
+xgb_mod  = train(
+  out.total.energy ~ Hour + Temp + Setpoint,
+  data      = train_df,
+  method    = "xgbTree",
+  trControl = xgb_ctrl
+)
+
+# 3. Build prediction data for “current” and “future (current + 5°C)”
+base_df = cleaned_df %>%
+  filter(month(datetime)==7) %>%
+  mutate(
+    Hour = hour(datetime),
+    Temp = `Dry Bulb Temperature [°C]`,
+    Setpoint = in.cooling_setpoint
+  ) %>%
+  select(Hour, Temp, Setpoint)
+
+orig_df = base_df
+fut_df  = base_df %>% mutate(Temp = Temp + 5)
+
+# 4. Predict outside of dplyr
+pred_curr = predict(xgb_mod, newdata = orig_df)
+pred_fut  = predict(xgb_mod, newdata = fut_df)
+
+# 5. Combine & aggregate by hour
+scenario_hourly = tibble(
+  Hour          = orig_df$Hour,
+  current_usage = pred_curr,
+  future_usage  = pred_fut
+) %>%
+  group_by(Hour) %>%
+  summarise(
+    current_usage = sum(current_usage, na.rm=TRUE),
+    future_usage  = sum(future_usage,  na.rm=TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols      = c(current_usage, future_usage),
+    names_to  = "scenario",
+    values_to = "energy_kWh"
+  )
+
+# 6. Plot
+ggplot(scenario_hourly, aes(x=Hour, y=energy_kWh, fill=scenario)) +
+  geom_col(position="dodge") +
+  scale_x_continuous(breaks=0:23) +
+  labs(
+    title = "Current vs. Future (+5°C) Energy Usage by Hour",
+    x     = "Hour",
+    y     = "Energy (kWh)",
+    fill  = "Scenario"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust=0.5))
+```
