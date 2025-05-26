@@ -29,7 +29,7 @@ Final dataset: 12M+ records representing hourly usage across the summer season.
 
 ---
 
- 🧰 **Tools & Technologies**
+ 🧰 #  Tools and Technologies
 
 - **Language**: R
 - **Modeling**: Generalized Additive Models (GAM), XGBoost, Linear Regression
