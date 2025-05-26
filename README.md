@@ -29,6 +29,17 @@ Final dataset: 12M+ records representing hourly usage across the summer season.
 
 ---
 
+ 🧰 Tools & Technologies
+
+- **Language**: R
+- **Modeling**: Generalized Additive Models (GAM), XGBoost, Linear Regression
+- **Data Manipulation**: `dplyr`, `data.table`
+- **Visualization**: `ggplot2`, `plotly`
+- **Dashboard**: `Shiny`, `shinydashboard`
+- **Others**: `lubridate`, `caret`, `mgcv`
+
+---
+
 ## 🔍 Key Findings
 
 - **Peak Usage Times**: 9–10 AM and 7–9 PM.
